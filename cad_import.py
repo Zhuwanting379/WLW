@@ -648,7 +648,7 @@ def cad_to_building(
         edge_set.add(k)
         na=building.get_node(id_map[ia]); nb=building.get_node(id_map[ib])
         if na and nb:
-            w = weight if weight and weight > 0 else na.dist_to(nb)
+            w = weight if weight > 0 else na.dist_to(nb)
             building.floors[fnum].edges.append(Edge(id_map[ia],id_map[ib],weight=w))
             return True
         return False

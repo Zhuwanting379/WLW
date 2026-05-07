@@ -29,7 +29,7 @@ STRUCT_LAYER_SKIP_PREFIX = (
 )
 
 
-def _read_doc(dxf_path: str):
+def _read_doc(dxf_path: str) -> "ezdxf.document.Drawing":
     try:
         return ezdxf.readfile(dxf_path)
     except Exception:
