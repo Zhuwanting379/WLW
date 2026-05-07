@@ -9,6 +9,15 @@
 
 用法
 ----
+  # 自动检测所有参数（推荐首次使用）
+  python import_from_dxf.py building.dxf --auto
+
+  # 先查看图层信息，再手动微调
+  python import_from_dxf.py building.dxf --show-layers
+
+  # 自动检测 + 覆盖部分参数
+  python import_from_dxf.py building.dxf --auto --min-room-area 8.0
+
   # 阶段一：仅解析 DXF，输出图像（不指定火灾位置）
   python import_from_dxf.py building.dxf --scale 0.001
 
@@ -40,7 +49,7 @@
 
   --scale FLOAT         坐标缩放（毫米→米填 0.001，默认 1.0）
   --floor-height FLOAT  层高（米，默认 3.0）
-  --merge-tol FLOAT     节点合并距离阈值（米，默认 0.5）
+  --merge-tol FLOAT     节点合并距离阈值（米，默认 1.5）
   --min-room-area FLOAT 闭合多边形最小面积（m²，默认 2.0；台阶踏步约 3m²，
                         建议设为 8.0 以过滤；含大房间的图纸可保持 2.0）
   --max-poly-area FLOAT 闭合多边形最大面积（m²，默认 500.0；超过则为幅面边框）
@@ -72,6 +81,7 @@ import sys
 import os
 import argparse
 import logging
+from typing import List
 
 # ── 将脚本所在目录加入 sys.path，支持从任意目录运行 ──────────────
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -110,8 +120,8 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="坐标缩放（毫米→米: 0.001，默认 1.0）")
     g.add_argument("--floor-height", type=float, default=3.0, dest="floor_height",
                    help="层高（米，默认 3.0）")
-    g.add_argument("--merge-tol", type=float, default=0.5, dest="merge_tol",
-                   help="节点合并距离（米，默认 0.5）")
+    g.add_argument("--merge-tol", type=float, default=1.5, dest="merge_tol",
+                   help="节点合并距离（米，默认 1.5）")
     g.add_argument("--min-room-area", type=float, default=2.0, dest="min_room_area",
                    help="闭合多边形最小面积 m²（默认 2.0；建议 8.0 过滤台阶踏步）")
     g.add_argument("--max-poly-area", type=float, default=500.0, dest="max_poly_area",
@@ -142,6 +152,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # ── 输出参数 ────────────────────────────────────────────────
     g3 = p.add_argument_group("输出参数")
+    g3.add_argument("--auto", action="store_true",
+                    help="自动从 DXF 提取 scale/floor_regions/structure_layers/exit_positions")
+    g3.add_argument("--show-layers", action="store_true", dest="show_layers",
+                    help="打印 DXF 图层统计后退出")
     g3.add_argument("--output-dir", default=os.path.join(_HERE, "output"),
                     dest="output_dir", help="输出图像目录（默认 ./output）")
     g3.add_argument("--validate-only", action="store_true",
@@ -170,9 +184,21 @@ def main() -> int:
         print(f"  ✗ 文件不存在: {args.dxf_path}")
         return 1
 
+    if args.show_layers:
+        from dxf_auto_config import print_dxf_info
+        print_dxf_info(args.dxf_path)
+        return 0
+
     # ── 阶段一：解析 DXF，构建建筑拓扑图 ─────────────────────────
     print(f"\n[1/4] 解析 DXF 文件: {args.dxf_path}")
-    cfg = _build_config(args)
+    cli_opts = _collect_cli_opts(sys.argv[1:])
+    if args.auto:
+        from dxf_auto_config import auto_detect_config
+        cfg = auto_detect_config(args.dxf_path, verbose=True)
+        _apply_manual_overrides(cfg, args, cli_opts)
+    else:
+        cfg = _build_config(args)
+    cfg.building_name = os.path.splitext(os.path.basename(args.dxf_path))[0]
     _print_config_summary(cfg)
 
     try:
@@ -271,38 +297,8 @@ def main() -> int:
 
 def _build_config(args) -> DXFImportConfig:
     """从命令行参数构建 DXFImportConfig。"""
-    # 解析 --floor-region "F,XMIN,XMAX,YMIN,YMAX"
-    regions = []
-    for s in args.floor_regions:
-        parts = [p.strip() for p in s.split(",")]
-        if len(parts) != 5:
-            print(f"  ⚠ 忽略无效 --floor-region '{s}'（格式: 楼层,x_min,x_max,y_min,y_max）")
-            continue
-        try:
-            regions.append(FloorRegion(
-                floor=int(parts[0]),
-                x_min=float(parts[1]), x_max=float(parts[2]),
-                y_min=float(parts[3]), y_max=float(parts[4]),
-            ))
-        except ValueError:
-            print(f"  ⚠ 忽略无法解析的 --floor-region '{s}'")
-
-    # 解析 --exit-pos "F,X,Y,LABEL"
-    exits = []
-    for s in args.exit_positions:
-        parts = s.split(",", 3)
-        if len(parts) < 3:
-            print(f"  ⚠ 忽略无效 --exit-pos '{s}'（格式: 楼层,x,y,标签）")
-            continue
-        try:
-            exits.append((
-                int(parts[0]),
-                float(parts[1]),
-                float(parts[2]),
-                parts[3].strip() if len(parts) > 3 else "出口",
-            ))
-        except ValueError:
-            print(f"  ⚠ 忽略无法解析的 --exit-pos '{s}'")
+    regions = _parse_floor_regions(args.floor_regions)
+    exits = _parse_exit_positions(args.exit_positions)
 
     return DXFImportConfig(
         scale                 = args.scale,
@@ -316,6 +312,74 @@ def _build_config(args) -> DXFImportConfig:
         exit_positions        = exits,
         building_name         = os.path.splitext(os.path.basename(args.dxf_path))[0],
     )
+
+
+def _collect_cli_opts(argv: List[str]) -> set:
+    opts = set()
+    for a in argv:
+        if not a.startswith("--"):
+            continue
+        name = a.split("=", 1)[0]
+        opts.add(name)
+    return opts
+
+
+def _parse_floor_regions(values: List[str]) -> List[FloorRegion]:
+    regions: List[FloorRegion] = []
+    for s in values:
+        parts = [p.strip() for p in s.split(",")]
+        if len(parts) != 5:
+            print(f"  ⚠ 忽略无效 --floor-region '{s}'（格式: 楼层,x_min,x_max,y_min,y_max）")
+            continue
+        try:
+            regions.append(FloorRegion(
+                floor=int(parts[0]),
+                x_min=float(parts[1]), x_max=float(parts[2]),
+                y_min=float(parts[3]), y_max=float(parts[4]),
+            ))
+        except ValueError:
+            print(f"  ⚠ 忽略无法解析的 --floor-region '{s}'")
+    return regions
+
+
+def _parse_exit_positions(values: List[str]) -> List[tuple]:
+    exits: List[tuple] = []
+    for s in values:
+        parts = s.split(",", 3)
+        if len(parts) < 3:
+            print(f"  ⚠ 忽略无效 --exit-pos '{s}'（格式: 楼层,x,y,标签）")
+            continue
+        try:
+            exits.append((
+                int(parts[0]),
+                float(parts[1]),
+                float(parts[2]),
+                parts[3].strip() if len(parts) > 3 else "出口",
+            ))
+        except ValueError:
+            print(f"  ⚠ 忽略无法解析的 --exit-pos '{s}'")
+    return exits
+
+
+def _apply_manual_overrides(cfg: DXFImportConfig, args, cli_opts: set) -> None:
+    if "--scale" in cli_opts:
+        cfg.scale = args.scale
+    if "--floor-height" in cli_opts:
+        cfg.floor_height = args.floor_height
+    if "--merge-tol" in cli_opts:
+        cfg.node_merge_tolerance = args.merge_tol
+    if "--min-room-area" in cli_opts:
+        cfg.min_room_area = args.min_room_area
+    if "--max-poly-area" in cli_opts:
+        cfg.max_polygon_area_m2 = args.max_poly_area
+    if args.floor_regions:
+        cfg.floor_regions = _parse_floor_regions(args.floor_regions)
+    if args.structure_layers:
+        cfg.structure_layers = args.structure_layers
+    if "--extra-stair" in cli_opts:
+        cfg.extra_stair_layers = args.extra_stair_layers
+    if args.exit_positions:
+        cfg.exit_positions = _parse_exit_positions(args.exit_positions)
 
 
 # ============================================================
