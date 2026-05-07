@@ -177,7 +177,7 @@ class DXFImportConfig:
     door_exit_floor: int = 1
 
     # ── 几何阈值 ─────────────────────────────────────────────────
-    node_merge_tolerance:  float = 0.5
+    node_merge_tolerance:  float = 1.5
     min_room_area:         float = 2.0    # m²，小于此值丢弃（墙厚矩形/台阶踏步）
     max_polygon_area_m2:   float = 500.0  # m²，大于此值丢弃（幅面边框/用地红线）
     max_circle_stair_r:    float = 3.0    # 圆半径 ≤ 此值 → 楼梯节点
@@ -204,6 +204,7 @@ class _RawNode:
 class _RawEdge:
     ax: float; ay: float; bx: float; by: float; floor: int
     ntype: str = NODE_CORRIDOR
+    poly_len: float = 0.0
 
 
 # ============================================================
@@ -378,11 +379,11 @@ class DXFParser:
             resolved = ntype or NODE_CORRIDOR
             if resolved not in (NODE_CORRIDOR, NODE_STAIR, NODE_EXIT): return
             fl = self._floor(lyr, pts[0][0], pts[0][1])
-            for p in pts:
-                self.raw_nodes.append(_RawNode(p[0],p[1],fl,resolved,source="LWPOLY_o"))
-            for i in range(len(pts)-1):
-                self.raw_edges.append(
-                    _RawEdge(pts[i][0],pts[i][1],pts[i+1][0],pts[i+1][1],fl,resolved))
+            self.raw_nodes.append(_RawNode(pts[0][0], pts[0][1], fl, resolved, source="LWPOLY_o"))
+            self.raw_nodes.append(_RawNode(pts[-1][0], pts[-1][1], fl, resolved, source="LWPOLY_o"))
+            poly_len = sum(_d2(*pts[i], *pts[i+1]) for i in range(len(pts)-1))
+            self.raw_edges.append(
+                _RawEdge(pts[0][0], pts[0][1], pts[-1][0], pts[-1][1], fl, resolved, poly_len=poly_len))
 
     def _line(self, ent, lyr, ntype):
         ax=self._s(ent.dxf.start.x); ay=self._s(ent.dxf.start.y)
@@ -411,11 +412,11 @@ class DXFParser:
         resolved = ntype or NODE_CORRIDOR
         if resolved not in (NODE_CORRIDOR, NODE_STAIR, NODE_EXIT): return
         fl = self._floor(lyr, pts[0][0], pts[0][1])
-        for p in pts:
-            self.raw_nodes.append(_RawNode(p[0],p[1],fl,resolved,source="POLY"))
-        for i in range(len(pts)-1):
-            self.raw_edges.append(
-                _RawEdge(pts[i][0],pts[i][1],pts[i+1][0],pts[i+1][1],fl,resolved))
+        self.raw_nodes.append(_RawNode(pts[0][0], pts[0][1], fl, resolved, source="POLY"))
+        self.raw_nodes.append(_RawNode(pts[-1][0], pts[-1][1], fl, resolved, source="POLY"))
+        poly_len = sum(_d2(*pts[i], *pts[i+1]) for i in range(len(pts)-1))
+        self.raw_edges.append(
+            _RawEdge(pts[0][0], pts[0][1], pts[-1][0], pts[-1][1], fl, resolved, poly_len=poly_len))
 
     def _circle(self, ent, lyr, ntype):
         cx=self._s(ent.dxf.center.x); cy=self._s(ent.dxf.center.y)
@@ -527,6 +528,8 @@ class _NodeMerger:
     def merge(self, raw:List[_RawNode]) -> List[_RawNode]:
         n=len(raw)
         if not n: return []
+        if self.tol <= 0:
+            return list(raw)
         par=list(range(n))
 
         def find(i):
@@ -536,15 +539,22 @@ class _NodeMerger:
             ra,rb=find(a),find(b)
             if ra!=rb: par[rb]=ra
 
-        buckets:Dict[int,List[int]]=defaultdict(list)
-        for i,rn in enumerate(raw): buckets[rn.floor].append(i)
-        for ids in buckets.values():
-            for ii in range(len(ids)):
-                for jj in range(ii+1,len(ids)):
-                    ia,ib=ids[ii],ids[jj]
-                    if find(ia)==find(ib): continue
-                    if _d2(raw[ia].x,raw[ia].y,raw[ib].x,raw[ib].y)<self.tol:
-                        union(ia,ib)
+        floor_buckets: Dict[int, Dict[Tuple[int,int], List[int]]] = defaultdict(lambda: defaultdict(list))
+        for i, rn in enumerate(raw):
+            gx = int(math.floor(rn.x / self.tol))
+            gy = int(math.floor(rn.y / self.tol))
+            floor_buckets[rn.floor][(gx, gy)].append(i)
+
+        for grid in floor_buckets.values():
+            for (gx, gy), ids in grid.items():
+                for ia in ids:
+                    for dgx in (-1, 0, 1):
+                        for dgy in (-1, 0, 1):
+                            for ib in grid.get((gx + dgx, gy + dgy), []):
+                                if ia >= ib: continue
+                                if find(ia)==find(ib): continue
+                                if _d2(raw[ia].x,raw[ia].y,raw[ib].x,raw[ib].y)<self.tol:
+                                    union(ia,ib)
 
         groups:Dict[int,List[int]]=defaultdict(list)
         for i in range(n): groups[find(i)].append(i)
@@ -631,14 +641,15 @@ def cad_to_building(
             if d<bd: bd=d; best=i
         return best
 
-    def _add(fnum,ia,ib) -> bool:
+    def _add(fnum,ia,ib,weight:float=0.0) -> bool:
         if ia==ib: return False
         k=(min(id_map[ia],id_map[ib]),max(id_map[ia],id_map[ib]))
         if k in edge_set: return False
         edge_set.add(k)
         na=building.get_node(id_map[ia]); nb=building.get_node(id_map[ib])
         if na and nb:
-            building.floors[fnum].edges.append(Edge(id_map[ia],id_map[ib],weight=na.dist_to(nb)))
+            w = weight if weight and weight > 0 else na.dist_to(nb)
+            building.floors[fnum].edges.append(Edge(id_map[ia],id_map[ib],weight=w))
             return True
         return False
 
@@ -646,7 +657,7 @@ def cad_to_building(
     for re_ in parser.raw_edges:
         ia=_nearest(re_.ax,re_.ay,re_.floor)
         ib=_nearest(re_.bx,re_.by,re_.floor)
-        if ia is not None and ib is not None and _add(re_.floor,ia,ib):
+        if ia is not None and ib is not None and _add(re_.floor,ia,ib,re_.poly_len):
             mapped+=1
     logger.info("步骤4 边映射: %d / %d", mapped, len(parser.raw_edges))
 
