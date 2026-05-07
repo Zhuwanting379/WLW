@@ -3,6 +3,7 @@ DXF → Building 转换模块（v3）
 ==============================
 git 我将要接着测试
 我已经创建了一个new banch
+是的我又来测试了
 
 将 AutoCAD DXF 文件解析并转换为 fire_escape_system.py 中的 Building 对象。
 本模块只负责"构建建筑拓扑图"（两阶段流程的第一阶段），
